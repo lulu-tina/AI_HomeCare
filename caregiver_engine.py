@@ -22,6 +22,12 @@ EXCLUSION_MAP = {
     "拒菸害環境": "有抽菸",
 }
 
+# 法定 20 小時特照培訓：案家需求類別 -> 合格居服員「核心專長證照」集合。
+# 居服員若不具備對應證照，該配對於 Phase 1 直接硬性剔除，不得派單。
+SPECIAL_CERT_REQUIREMENTS = {
+    "失智引導與精神陪伴": {"失智症照顧專長", "精神疾病照顧專長"},
+}
+
 
 @dataclass
 class PipelineConfig:
@@ -35,7 +41,9 @@ class PipelineConfig:
     base_score: float = 60.0
     cert_bonus_dementia: float = 15.0
     cert_bonus_other: float = 10.0
-    preferred_caregiver_bonus: float = 20.0
+    preferred_caregiver_bonus: float = 60.0
+    continuity_performance_bonus: float = 15.0
+    continuity_satisfaction_threshold: float = 4.3
     satisfaction_baseline: float = 4.0
     satisfaction_weight: float = 10.0
     travel_penalty_weight: float = 0.5
@@ -85,6 +93,35 @@ def parse_time(time_str):
     )
 
 
+def _check_hard_constraints(task, cg, config: "PipelineConfig"):
+    """檢查單一 (任務, 居服員) 配對的硬性條件。全數通過回傳 None，否則回傳未通過原因。
+
+    抽成獨立函式供 Phase 1 過濾與「更新居服員原因」診斷共用同一套判斷邏輯。
+    """
+    req_gender = task["指定居服員性別"]
+    if req_gender == "限女性" and cg["性別"] != "女":
+        return "案家指定女性居服員，原居服員性別不符"
+    if req_gender == "限男性" and cg["性別"] != "男":
+        return "案家指定男性居服員，原居服員性別不符"
+
+    if task["需重度移位協助(0/1)"] == 1 and cg["具備重度移位體力(0/1)"] == 0:
+        return "案家需重度移位協助，原居服員不具備相關體力條件"
+
+    cg_excl = cg["特殊排斥條件"]
+    if cg_excl in EXCLUSION_MAP and task["案家環境特徵"] == EXCLUSION_MAP[cg_excl]:
+        return f"原居服員排斥「{EXCLUSION_MAP[cg_excl]}」環境條件"
+
+    task_duration_hrs = task["服務歷時(分鐘)"] / 60.0
+    if cg["今日已佔用工時(小時)"] + task_duration_hrs > cg["每日工時上限(小時)"]:
+        return "原居服員今日工時已達每日上限"
+
+    required_certs = SPECIAL_CERT_REQUIREMENTS.get(task["特殊照護需求"])
+    if required_certs and cg["核心專長證照"] not in required_certs:
+        return "原居服員缺乏該需求類別之法定專長認證"
+
+    return None
+
+
 # ==========================================
 # Phase 1: 適配度過濾與評分機制
 # ==========================================
@@ -94,12 +131,8 @@ def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: Pipeli
     for _, task in tasks.iterrows():
         t_id = task["任務ID"]
         c_id = task["案家ID"]
-        req_gender = task["指定居服員性別"]
-        req_lift = task["需重度移位協助(0/1)"]
-        client_env = task["案家環境特徵"]
         client_lat = task["服務地點_緯度"]
         client_lon = task["服務地點_經度"]
-        task_duration_hrs = task["服務歷時(分鐘)"] / 60.0
         pref_cg = task["歷史首選居服員ID"]
         req_type = task["特殊照護需求"]
 
@@ -107,28 +140,14 @@ def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: Pipeli
             cg_id = cg["居服員ID"]
 
             # --- Hard Constraints (硬性過濾，不合格者直接剔除) ---
-            if req_gender == "限女性" and cg["性別"] != "女":
-                continue
-            if req_gender == "限男性" and cg["性別"] != "男":
+            if _check_hard_constraints(task, cg, config) is not None:
                 continue
 
-            if req_lift == 1 and cg["具備重度移位體力(0/1)"] == 0:
-                continue
-
-            cg_excl = cg["特殊排斥條件"]
-            if cg_excl in EXCLUSION_MAP and client_env == EXCLUSION_MAP[cg_excl]:
-                continue
-
-            if (
-                cg["今日已佔用工時(小時)"] + task_duration_hrs
-                > cg["每日工時上限(小時)"]
-            ):
-                continue
+            cert = cg["核心專長證照"]
 
             # --- Soft Match Scoring ---
             score = config.base_score
 
-            cert = cg["核心專長證照"]
             if req_type == "失智引導與精神陪伴" and cert in [
                 "失智症照顧專長",
                 "精神疾病照顧專長",
@@ -138,7 +157,11 @@ def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: Pipeli
                 score += config.cert_bonus_other
 
             if cg_id == pref_cg:
+                # 照護連續性為最高指導原則：基礎加分已大幅提高，避免微幅車程/成本優化
+                # 就任意更換案家熟悉的居服員；表現優良（滿意度達門檻）者再疊加動態加成。
                 score += config.preferred_caregiver_bonus
+                if cg["歷史滿意度均值"] >= config.continuity_satisfaction_threshold:
+                    score += config.continuity_performance_bonus
 
             score += (cg["歷史滿意度均值"] - config.satisfaction_baseline) * config.satisfaction_weight
 
@@ -166,10 +189,58 @@ def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: Pipeli
                     "優先級": task["任務優先級"],
                     "地點緯度": client_lat,
                     "地點經度": client_lon,
+                    "具備失智症20小時認證(0/1)": int(cert == "失智症照顧專長"),
+                    "具備精神疾病20小時認證(0/1)": int(cert == "精神疾病照顧專長"),
                 }
             )
 
     return pd.DataFrame(match_results)
+
+
+def _diagnose_caregiver_change(
+    task_row,
+    pref_cg_id,
+    assigned_cg_id,
+    df_cg: pd.DataFrame,
+    df_matches: pd.DataFrame,
+    df_valid: pd.DataFrame,
+    other_assigned_task_ids,
+    task_times: dict,
+    config: "PipelineConfig",
+) -> str:
+    """回傳「更新居服員原因」文字。案家為新客戶（無歷史首選居服員）或本次
+    仍指派給原居服員時回傳空字串；僅在確實更換居服員時才需要說明原因。
+    """
+    if pd.isna(pref_cg_id) or str(pref_cg_id).strip() == "":
+        return ""
+    if pref_cg_id == assigned_cg_id:
+        return ""
+
+    t_id = task_row["任務ID"]
+
+    pref_in_matches = ((df_matches["任務ID"] == t_id) & (df_matches["居服員ID"] == pref_cg_id)).any()
+    if not pref_in_matches:
+        cg_rows = df_cg[df_cg["居服員ID"] == pref_cg_id]
+        if cg_rows.empty:
+            return "原居服員資料異動，查無此居服員"
+        return _check_hard_constraints(task_row, cg_rows.iloc[0], config) or "原居服員不符合硬性派單條件"
+
+    pref_in_valid = ((df_valid["任務ID"] == t_id) & (df_valid["居服員ID"] == pref_cg_id)).any()
+    if not pref_in_valid:
+        return "原居服員今日既定行程與本任務時段衝突"
+
+    t_start, t_end, t_lat, t_lon = task_times[t_id]
+    for other_t_id in other_assigned_task_ids:
+        o_start, o_end, o_lat, o_lon = task_times[other_t_id]
+        dist = calc_distance_km(t_lat, t_lon, o_lat, o_lon)
+        travel_mins = dist * config.travel_min_per_km + config.buffer_mins
+        if not (
+            t_end + timedelta(minutes=travel_mins) <= o_start
+            or o_end + timedelta(minutes=travel_mins) <= t_start
+        ):
+            return "原居服員該時段已媒合其他案家任務"
+
+    return "原居服員符合派單資格，惟系統整體最佳化後綜合適配分數較低，改派其他居服員"
 
 
 # ==========================================
@@ -277,6 +348,25 @@ def run_phase2_optimization(
                 ):
                     solver.Add(X[(t1_id, cg_id)] + X[(t2_id, cg_id)] <= 1)
 
+    # 限制條件 3：居服員今日新派任務總歷時 + 既有已佔用工時，不得超過每日工時上限。
+    # Phase 1 僅逐筆過濾單一任務是否超時，無法阻擋「多筆任務加總後超派」的組合，
+    # 此為求解器層級的產能限制式，修復該缺口。
+    task_duration_hrs = {
+        row["任務ID"]: row["服務歷時(分鐘)"] / 60.0 for _, row in tasks.iterrows()
+    }
+    cg_capacity = {
+        row["居服員ID"]: (row["今日已佔用工時(小時)"], row["每日工時上限(小時)"])
+        for _, row in df_cg.iterrows()
+    }
+    for cg_id in df_valid["居服員ID"].unique():
+        used_hours, cap_hours = cg_capacity.get(cg_id, (0.0, float("inf")))
+        cg_task_ids = df_valid[df_valid["居服員ID"] == cg_id]["任務ID"].unique()
+        solver.Add(
+            sum(X[(t_id, cg_id)] * task_duration_hrs[t_id] for t_id in cg_task_ids)
+            + used_hours
+            <= cap_hours
+        )
+
     # 目標函數：Z = 適配度分數 - w*交通時間 + 優先級權重
     objective = solver.Objective()
     for _, row in df_valid.iterrows():
@@ -318,6 +408,30 @@ def run_phase2_optimization(
                         "地點經度": row_data["地點經度"],
                     }
                 )
+
+        # 每位居服員本次新指派到的任務清單，供「更新居服員原因」判斷同時段衝突用
+        assigned_task_ids_by_cg = {}
+        for row in results:
+            assigned_task_ids_by_cg.setdefault(row["派單居服員"], []).append(row["任務ID"])
+
+        for row in results:
+            t_id = row["任務ID"]
+            task_row = tasks[tasks["任務ID"] == t_id].iloc[0]
+            pref_cg_id = task_row["歷史首選居服員ID"]
+            other_task_ids = [
+                tid for tid in assigned_task_ids_by_cg.get(pref_cg_id, []) if tid != t_id
+            ]
+            row["更新居服員原因"] = _diagnose_caregiver_change(
+                task_row,
+                pref_cg_id,
+                row["派單居服員"],
+                df_cg,
+                df_matches,
+                df_valid,
+                other_task_ids,
+                task_times,
+                config,
+            )
 
         df_result = pd.DataFrame(results)
         if not df_result.empty:

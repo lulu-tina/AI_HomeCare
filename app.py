@@ -113,9 +113,10 @@ with st.sidebar:
         help="任務優先級標示為「緊急」時，在派單目標函數中額外獲得的加分，數值越高代表緊急任務越優先被指派。",
     )
     continuity_bonus = st.slider(
-        "照護連續性加分（分）", 0.0, 50.0, defaults.preferred_caregiver_bonus, 1.0,
+        "照護連續性加分（分）", 0.0, 100.0, defaults.preferred_caregiver_bonus, 1.0,
         key="cfg_continuity_bonus",
-        help="當案家的歷史首選居服員恰為候選居服員時的加分，鼓勵維持既有照護關係與默契。",
+        help="當案家的歷史首選居服員恰為候選居服員時的加分，鼓勵維持既有照護關係與默契。"
+        "表現優良（滿意度達門檻）的首選居服員另有動態加成，避免因車程等微幅優化而被替換。",
     )
     skill_bonus = st.slider(
         "核心專長匹配加分（分）", 0.0, 50.0, defaults.cert_bonus_dementia, 1.0,
@@ -349,7 +350,10 @@ if "last_result" in st.session_state:
     if df_result.empty:
         st.info("目前無派單結果。")
     else:
-        display_cols = ["任務ID", "案家ID", "派單居服員", "適配分數", "預估車程(分)", "服務時段", "任務優先級"]
+        display_cols = [
+            "任務ID", "案家ID", "派單居服員", "適配分數", "預估車程(分)", "服務時段", "任務優先級",
+            "更新居服員原因",
+        ]
         st.dataframe(df_result[display_cols], width="stretch", hide_index=True)
 
         csv = df_result[display_cols].to_csv(index=False).encode("utf-8-sig")
