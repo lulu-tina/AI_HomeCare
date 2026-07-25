@@ -26,7 +26,7 @@ Web dashboard (interactive, adjustable parameters):
 streamlit run app.py
 ```
 
-Requires: `pandas`, `numpy`, `openpyxl` (for reading `.xlsx`), `ortools` (for the MIP solver), and — for the web dashboard only — `streamlit`, `matplotlib`, and `seaborn`. Both entry points must be run from the repo root since data loads via the relative path `./00_DB/AI_Caregiver_Allocation_Ultimate_Database.xlsx` (used by `app.py` only as the fallback when no file is uploaded).
+Requires: `pandas`, `numpy`, `openpyxl` (for reading `.xlsx`), `ortools` (for the MIP solver), `requests` (for OSRM travel-time queries — see "Travel time model" below), and — for the web dashboard only — `streamlit`, `matplotlib`, and `seaborn`. Both entry points must be run from the repo root since data loads via the relative path `./00_DB/AI_Caregiver_Allocation_Ultimate_Database.xlsx` (used by `app.py` only as the fallback when no file is uploaded). Live scheduling runs need outbound internet access to `router.project-osrm.org`; without it, every travel-time lookup falls back to the flat-degree estimate (see below) and prints a warning per unique coordinate pair or batch.
 
 There are no lint/test/build commands configured in this repo.
 
@@ -49,7 +49,7 @@ Three sequential phases, each a standalone function that both `ai_caregiver_pipe
 
 1. **Phase 1 — `run_phase1_matching`** (candidate generation): for every (task × caregiver) pair, apply hard filters, then score survivors starting from `config.base_score` (default 60):
    - Hard filters (reject pair entirely): gender requirement, heavy-lift capability requirement, `EXCLUSION_MAP` environment conflicts (caregiver aversion vs. client environment tag), and daily-hour-cap overflow. These are not exposed as adjustable — they are eligibility rules, not dispatch policy.
-   - Soft scoring (`score`, floored at 0): +certification match (`cert_bonus_dementia` / `cert_bonus_other`), +`preferred_caregiver_bonus` for historical preferred caregiver, +satisfaction deviation from `satisfaction_baseline` weighted by `satisfaction_weight`, −travel-time penalty (weighted by `travel_penalty_weight`, capped at `travel_penalty_cap`) computed from `calc_distance_km` (a flat-degree approximation, not haversine — 1° lat ≈ 111 km, 1° lon ≈ 101 km, tuned for Taiwan's latitude; not exposed as adjustable), −fatigue penalty (`fatigue_weight`) based on monthly cumulative hours vs. `fatigue_reference_hours`.
+   - Soft scoring (`score`, floored at 0): +certification match (`cert_bonus_dementia` / `cert_bonus_other`), +`preferred_caregiver_bonus` for historical preferred caregiver, +satisfaction deviation from `satisfaction_baseline` weighted by `satisfaction_weight`, −travel-time penalty (weighted by `travel_penalty_weight`, capped at `travel_penalty_cap`) computed from `calc_travel_minutes` (real OSRM road-network minutes, falling back to the `calc_distance_km` flat-degree approximation on API failure — see "Travel time model" below), −fatigue penalty (`fatigue_weight`) based on **service-intensity-weighted** monthly cumulative hours vs. `fatigue_reference_hours` (see "Fatigue model" below).
    - Output: `df_matches`, one row per surviving (task, caregiver) candidate pair.
 
 2. **Phase 2 — `run_phase2_optimization`** (time-conflict filtering + OR-Tools MIP):
@@ -62,9 +62,21 @@ Three sequential phases, each a standalone function that both `ai_caregiver_pipe
 
 All dispatch-policy coefficients named above live in the `PipelineConfig` dataclass; `app.py`'s sidebar exposes one slider per field. When adding a new tunable coefficient, add it to `PipelineConfig` first, thread it through the relevant Phase function, then add a sidebar slider — never hardcode a new policy constant directly in `app.py` or `ai_caregiver_pipeline.py`.
 
-### Key invariants when modifying this pipeline
+### Travel time model (OSRM)
 
-- `calc_distance_km` and the `travel_mins = dist_km * config.travel_min_per_km + config.buffer_mins` formula are used identically in three places (scoring, existing-schedule conflict check, new-task-pair conflict check) — keep them consistent if changing the transit-time model.
+- `calc_travel_minutes(lat1, lon1, lat2, lon2, config)` is the single entry point for transition travel time, used identically in four places: Phase 1 scoring, Phase 2's existing-schedule conflict check, Phase 2's new-task-pair conflict check, and `_diagnose_caregiver_change`'s pair check — keep them consistent if changing the transit-time model.
+- Internally it calls `get_osrm_travel_time`, which queries the free OSRM public API (`router.project-osrm.org`, `biking` profile) for real road-network minutes between two points, backed by a module-level dict cache (`_OSRM_TRAVEL_TIME_CACHE`, keyed on coordinates rounded to 6 decimals). On request timeout (`OSRM_TIMEOUT_SECONDS`), network failure, or a non-`Ok` response, it prints an `[OSRM Warning]` log and falls back to the `calc_distance_km` flat-degree estimate (1° lat ≈ 111 km, 1° lon ≈ 101 km) × `travel_min_per_km`.
+- Before their pairwise loops, `run_phase1_matching` and `run_phase2_optimization` each call `prefetch_osrm_travel_times(origins, destinations, travel_min_per_km)`, which batches the whole origin×destination coordinate set into one (or a few, chunked at `OSRM_TABLE_MAX_COORDS`) OSRM `/table` matrix requests and pre-populates the shared cache — this is what keeps a 20-caregiver × 25-task run to a handful of HTTP calls instead of hundreds; without it the per-pair fallback path still works, just far slower. A failed batch prints a warning and leaves those pairs to be resolved (and independently degrade) on the next per-pair `get_osrm_travel_time` call.
+- `OSRM_HOST` / `OSRM_PROFILE` / timeouts are module-level constants, not `PipelineConfig` fields (same pattern as `calc_distance_km`'s constants) — they're plumbing, not dispatch policy.
+
+### Fatigue model (service-intensity-weighted)
+
+- `get_service_intensity_weight(task)` maps a task to a strain coefficient via `SERVICE_INTENSITY_WEIGHT`: 1.5 for heavy transfer/joint mobility (`需重度移位協助(0/1)==1`), 1.2 for meal care/tube feeding/hygiene (`特殊照護需求` in `{餐食照顧/管灌, 管路安全與特殊日常照護}`), else 0.8 (general housework/companionship, including dementia care).
+- Phase 1 no longer uses the flat `cg["當月累計服務時數(疲勞度)"] / fatigue_reference_hours` ratio; it now multiplies the caregiver's cumulative hours by the *current candidate task's* intensity weight first: `fatigue_penalty = (cg累計時數 × intensity_weight) / fatigue_reference_hours × fatigue_weight`. This is evaluated per (task, caregiver) pair (Phase 1 has no per-service-type history to sum over), so assigning a physically demanding task to an already-fatigued caregiver is penalized more than assigning a light one.
+
+### Other invariants when modifying this pipeline
+
+
 - `EXCLUSION_MAP` keys are caregiver `特殊排斥條件` values; values are the matching `案家環境特徵` string they conflict with. Both sides are exact-string-matched against the Excel data, so any new exclusion category must be added to both the map and used consistently in the source spreadsheet.
 - Time strings in the workbook use `"HH:MM-HH:MM"` (or the literal `"無既定行程"` sentinel for "no existing appointment"); `parse_time` and the task-time parsing in Phase 2 assume this exact format.
 - `app.py` only re-runs Phases 1–3 when the "🚀 執行 AI 最佳化派單" button is clicked (not on every slider/data-editor change); the last result is kept in `st.session_state["last_result"]` and re-displayed on subsequent reruns until the button is clicked again. Raw sheet reads are `st.cache_data`-cached (keyed on upload identity or file path + mtime), but the edited copies of `Caregiver_Profiles`/`Client_Profiles`/`Today_Pending_Tasks` live separately in `st.session_state` (`edit_cg`/`edit_cl`/`edit_tasks`) so user edits survive reruns and aren't clobbered by the cache.

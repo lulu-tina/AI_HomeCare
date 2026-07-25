@@ -11,9 +11,24 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
+import requests
 from ortools.linear_solver import pywraplp
 
 DEFAULT_EXCEL_PATH = "./00_DB/AI_Caregiver_Allocation_Ultimate_Database.xlsx"
+
+# OSRM 公用路網 API 設定：預設查詢騎乘(機車/腳踏車)路網時間，逾時即降級為概算公式。
+OSRM_HOST = "http://router.project-osrm.org"
+OSRM_PROFILE = "biking"
+OSRM_TIMEOUT_SECONDS = 3.0
+OSRM_TABLE_TIMEOUT_SECONDS = 10.0
+OSRM_TABLE_MAX_COORDS = 90  # 單次 /table 批次查詢座標數上限，避免超出公用伺服器限制
+
+# 服務項目強度加權係數：依體力耗費強度分級，用於疲勞度模型。
+SERVICE_INTENSITY_WEIGHT = {
+    "重度移位": 1.5,  # 重度移位／肢體關節活動
+    "餐食管灌": 1.2,  # 餐食照顧／管灌洗頭
+    "一般照護": 0.8,  # 一般家務／陪伴看護
+}
 
 # 環境排斥條件對照表 (居服員排斥 -> 案家環境)，兩側皆為 Excel 原始字串，需完全相符
 EXCLUSION_MAP = {
@@ -83,6 +98,136 @@ def calc_distance_km(lat1, lon1, lat2, lon2):
     return np.sqrt(dlat**2 + dlon**2)
 
 
+# 字典快取已查詢過的經緯度對 -> 路網時間(分鐘)，Phase 1 / Phase 2 共用同一份快取，
+# 避免同一對座標於不同階段重複發送 API 請求。
+_OSRM_TRAVEL_TIME_CACHE: dict = {}
+
+
+def _round_coord(v: float) -> float:
+    return round(float(v), 6)
+
+
+def _osrm_fallback_minutes(lat1, lon1, lat2, lon2, travel_min_per_km, reason) -> float:
+    """降級為 Haversine/歐式距離估算，並印出 Warning Log。"""
+    print(
+        f"[OSRM Warning] 路網查詢失敗 ({lat1},{lon1}) -> ({lat2},{lon2})，"
+        f"降級為 Haversine/歐式距離估算: {reason}"
+    )
+    return calc_distance_km(lat1, lon1, lat2, lon2) * travel_min_per_km
+
+
+def get_osrm_travel_time(lat1, lon1, lat2, lon2, travel_min_per_km=3.0):
+    """查詢 OSRM 公用路網 API，回傳兩點間真實路網騎乘時間（分鐘）。
+
+    以字典快取已查詢過的經緯度對，避免重複發送 API 請求（大量座標對可先呼叫
+    `prefetch_osrm_travel_times` 以單次 /table 批次請求暖身快取）。若 API 逾時、
+    網路斷線或回傳失敗，自動降級為 calc_distance_km 的概算距離公式，並印出
+    Warning Log，確保 Phase 1 / Phase 2 的排程運算不因外部服務中斷而失敗。
+    """
+    if lat1 == lat2 and lon1 == lon2:
+        return 0.0
+
+    key = (_round_coord(lat1), _round_coord(lon1), _round_coord(lat2), _round_coord(lon2))
+    if key in _OSRM_TRAVEL_TIME_CACHE:
+        return _OSRM_TRAVEL_TIME_CACHE[key]
+
+    url = f"{OSRM_HOST}/route/v1/{OSRM_PROFILE}/{lon1},{lat1};{lon2},{lat2}"
+    try:
+        resp = requests.get(url, params={"overview": "false"}, timeout=OSRM_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != "Ok" or not data.get("routes"):
+            raise ValueError(f"OSRM 回傳異常狀態: {data.get('code')}")
+        travel_min = data["routes"][0]["duration"] / 60.0
+    except Exception as exc:
+        travel_min = _osrm_fallback_minutes(lat1, lon1, lat2, lon2, travel_min_per_km, exc)
+
+    _OSRM_TRAVEL_TIME_CACHE[key] = travel_min
+    return travel_min
+
+
+def _fetch_osrm_table_chunk(origins, destinations, travel_min_per_km):
+    """對一批 origin x destination 座標呼叫 OSRM /table 矩陣 API，一次查詢多組配對的
+    路網時間，寫入共用快取。origins / destinations 皆為已四捨五入的 (lat, lon) tuple 清單。
+    """
+    coords = origins + destinations
+    coord_str = ";".join(f"{lon},{lat}" for lat, lon in coords)
+    sources = ";".join(str(i) for i in range(len(origins)))
+    dest_indices = ";".join(str(len(origins) + i) for i in range(len(destinations)))
+    url = f"{OSRM_HOST}/table/v1/{OSRM_PROFILE}/{coord_str}"
+
+    try:
+        resp = requests.get(
+            url,
+            params={"annotations": "duration", "sources": sources, "destinations": dest_indices},
+            timeout=OSRM_TABLE_TIMEOUT_SECONDS,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != "Ok":
+            raise ValueError(f"OSRM /table 回傳異常狀態: {data.get('code')}")
+        durations = data["durations"]
+    except Exception as exc:
+        print(
+            f"[OSRM Warning] /table 批次路網查詢失敗（{len(origins)}x{len(destinations)} 座標對），"
+            f"個別配對將於逐筆查詢時各自降級為概算公式: {exc}"
+        )
+        return
+
+    for i, (o_lat, o_lon) in enumerate(origins):
+        for j, (d_lat, d_lon) in enumerate(destinations):
+            key = (o_lat, o_lon, d_lat, d_lon)
+            duration_sec = durations[i][j]
+            if duration_sec is None:
+                _OSRM_TRAVEL_TIME_CACHE[key] = _osrm_fallback_minutes(
+                    o_lat, o_lon, d_lat, d_lon, travel_min_per_km, "OSRM /table 無法規劃該路徑"
+                )
+            else:
+                _OSRM_TRAVEL_TIME_CACHE[key] = duration_sec / 60.0
+
+
+def prefetch_osrm_travel_times(origins, destinations, travel_min_per_km=3.0) -> None:
+    """批次暖身 OSRM 路網時間快取，大幅降低 Phase 1 / Phase 2 的 API 呼叫次數。
+
+    origins / destinations 為 (lat, lon) 的可迭代物件（例如所有居服員住家座標 x 所有
+    任務地點座標）。以 OSRM `/table` 矩陣 API 一次查詢整批配對，取代逐筆呼叫
+    `get_osrm_travel_time` 各自發送一次 HTTP 請求；查詢結果寫入與 `get_osrm_travel_time`
+    共用的字典快取，之後逐筆呼叫即直接命中快取。任一批次查詢失敗僅印出 Warning Log
+    並跳過，未快取的配對會在後續逐筆查詢時各自降級為概算公式，不影響排程結果正確性。
+    """
+    unique_origins = sorted({(_round_coord(lat), _round_coord(lon)) for lat, lon in origins})
+    unique_destinations = sorted({(_round_coord(lat), _round_coord(lon)) for lat, lon in destinations})
+
+    pending_origins = [
+        o
+        for o in unique_origins
+        if any((o[0], o[1], d[0], d[1]) not in _OSRM_TRAVEL_TIME_CACHE for d in unique_destinations)
+    ]
+    if not pending_origins or not unique_destinations:
+        return
+
+    dest_chunk_size = max(1, OSRM_TABLE_MAX_COORDS - len(pending_origins))
+    for i in range(0, len(unique_destinations), dest_chunk_size):
+        dest_chunk = unique_destinations[i : i + dest_chunk_size]
+        _fetch_osrm_table_chunk(pending_origins, dest_chunk, travel_min_per_km)
+
+
+def calc_travel_minutes(lat1, lon1, lat2, lon2, config: "PipelineConfig") -> float:
+    """兩點間轉場車程（分鐘，不含轉場緩衝）。統一經由 get_osrm_travel_time 查詢，
+    Phase 1 評分與 Phase 2 衝突檢查皆呼叫此函式，確保交通時間模型一致。
+    """
+    return get_osrm_travel_time(lat1, lon1, lat2, lon2, config.travel_min_per_km)
+
+
+def get_service_intensity_weight(task) -> float:
+    """依服務項目之體力耗費強度，回傳該任務對應的疲勞度加權係數。"""
+    if task["需重度移位協助(0/1)"] == 1:
+        return SERVICE_INTENSITY_WEIGHT["重度移位"]
+    if task["特殊照護需求"] in ("餐食照顧/管灌", "管路安全與特殊日常照護"):
+        return SERVICE_INTENSITY_WEIGHT["餐食管灌"]
+    return SERVICE_INTENSITY_WEIGHT["一般照護"]
+
+
 def parse_time(time_str):
     if pd.isna(time_str) or time_str == "無既定行程":
         return None, None
@@ -128,6 +273,14 @@ def _check_hard_constraints(task, cg, config: "PipelineConfig"):
 def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
     match_results = []
 
+    # 進入逐筆比對迴圈前，先以單次 OSRM /table 批次查詢暖身快取（居服員住家 x 任務地點），
+    # 取代 N x M 次個別 HTTP 請求。
+    prefetch_osrm_travel_times(
+        ((cg["服務起點_緯度(家)"], cg["服務起點_經度(家)"]) for _, cg in df_cg.iterrows()),
+        ((task["服務地點_緯度"], task["服務地點_經度"]) for _, task in tasks.iterrows()),
+        config.travel_min_per_km,
+    )
+
     for _, task in tasks.iterrows():
         t_id = task["任務ID"]
         c_id = task["案家ID"]
@@ -165,16 +318,18 @@ def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: Pipeli
 
             score += (cg["歷史滿意度均值"] - config.satisfaction_baseline) * config.satisfaction_weight
 
-            dist_km = calc_distance_km(
+            travel_time_min = calc_travel_minutes(
                 cg["服務起點_緯度(家)"],
                 cg["服務起點_經度(家)"],
                 client_lat,
                 client_lon,
+                config,
             )
-            travel_time_min = dist_km * config.travel_min_per_km
             score -= min(travel_time_min * config.travel_penalty_weight, config.travel_penalty_cap)
 
-            fatigue_penalty = (cg["當月累計服務時數(疲勞度)"] / config.fatigue_reference_hours) * config.fatigue_weight
+            intensity_weight = get_service_intensity_weight(task)
+            weighted_fatigue_hours = cg["當月累計服務時數(疲勞度)"] * intensity_weight
+            fatigue_penalty = (weighted_fatigue_hours / config.fatigue_reference_hours) * config.fatigue_weight
             score -= fatigue_penalty
 
             match_results.append(
@@ -232,8 +387,7 @@ def _diagnose_caregiver_change(
     t_start, t_end, t_lat, t_lon = task_times[t_id]
     for other_t_id in other_assigned_task_ids:
         o_start, o_end, o_lat, o_lon = task_times[other_t_id]
-        dist = calc_distance_km(t_lat, t_lon, o_lat, o_lon)
-        travel_mins = dist * config.travel_min_per_km + config.buffer_mins
+        travel_mins = calc_travel_minutes(t_lat, t_lon, o_lat, o_lon, config) + config.buffer_mins
         if not (
             t_end + timedelta(minutes=travel_mins) <= o_start
             or o_end + timedelta(minutes=travel_mins) <= t_start
@@ -278,6 +432,16 @@ def run_phase2_optimization(
         t2 = datetime.strptime(task["時間窗_結束"].strip(), "%H:%M")
         task_times[t_id] = (t1, t2, task["服務地點_緯度"], task["服務地點_經度"])
 
+    # 進入衝突檢查迴圈前，先以 OSRM /table 批次查詢暖身快取（任務地點 x 既定行程地點、
+    # 任務地點 x 任務地點），取代逐筆個別 HTTP 請求。
+    task_coords = [(lat, lon) for _, _, lat, lon in task_times.values()]
+    busy_coords = [
+        (b_lat, b_lon) for intervals in cg_busy.values() for (_, _, b_lat, b_lon) in intervals
+    ]
+    if busy_coords:
+        prefetch_osrm_travel_times(task_coords, busy_coords, config.travel_min_per_km)
+    prefetch_osrm_travel_times(task_coords, task_coords, config.travel_min_per_km)
+
     # 過濾掉與既定行程衝突（含轉場緩衝時間）的配對
     valid_rows = []
     for _, row in df_matches.iterrows():
@@ -287,8 +451,7 @@ def run_phase2_optimization(
 
         conflict = False
         for b_start, b_end, b_lat, b_lon in cg_busy[cg_id]:
-            dist = calc_distance_km(t_lat, t_lon, b_lat, b_lon)
-            travel_mins = dist * config.travel_min_per_km + config.buffer_mins
+            travel_mins = calc_travel_minutes(t_lat, t_lon, b_lat, b_lon, config) + config.buffer_mins
             if not (
                 t_end + timedelta(minutes=travel_mins) <= b_start
                 or b_end + timedelta(minutes=travel_mins) <= t_start
@@ -339,8 +502,7 @@ def run_phase2_optimization(
                 t1_start, t1_end, t1_lat, t1_lon = task_times[t1_id]
                 t2_start, t2_end, t2_lat, t2_lon = task_times[t2_id]
 
-                dist = calc_distance_km(t1_lat, t1_lon, t2_lat, t2_lon)
-                travel_mins = dist * config.travel_min_per_km + config.buffer_mins
+                travel_mins = calc_travel_minutes(t1_lat, t1_lon, t2_lat, t2_lon, config) + config.buffer_mins
 
                 if not (
                     t1_end + timedelta(minutes=travel_mins) <= t2_start
