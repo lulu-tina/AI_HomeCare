@@ -14,8 +14,7 @@
 caregiver_engine.py，本檔僅負責資料編輯介面與結果呈現，不重複實作演算法。
 """
 
-import sys
-
+import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
@@ -36,12 +35,18 @@ from caregiver_engine import (
 # 跨平台中文字型處理（避免 st.pyplot 圖表出現亂碼）
 # ==========================================
 def setup_chinese_font():
-    if sys.platform.startswith("win"):
-        plt.rcParams["font.sans-serif"] = ["Microsoft JhengHei", "SimHei", "DejaVu Sans"]
-    elif sys.platform.startswith("darwin"):
-        plt.rcParams["font.sans-serif"] = ["Arial Unicode MS", "Heiti TC", "DejaVu Sans"]
-    else:
-        plt.rcParams["font.sans-serif"] = ["WenQuanYi Micro Hei", "DejaVu Sans"]
+    # 依平台猜測字型名稱不可靠：Streamlit Cloud（Linux）容器內不一定裝有猜測的字型，
+    # 猜錯字型 matplotlib 不會報錯，只會靜默退回 DejaVu Sans（無中文字形，顯示為方框）。
+    # 改為實際查詢 matplotlib font_manager 已註冊的字型，取第一個存在的候選。
+    candidates = [
+        "Microsoft JhengHei", "Microsoft YaHei", "SimHei",  # Windows
+        "PingFang TC", "PingFang SC", "Heiti TC", "Arial Unicode MS",  # macOS
+        "Noto Sans CJK TC", "Noto Sans CJK SC", "Noto Sans TC",  # Linux / Streamlit Cloud (packages.txt: fonts-noto-cjk)
+        "WenQuanYi Micro Hei", "WenQuanYi Zen Hei",
+    ]
+    available = {f.name for f in fm.fontManager.ttflist}
+    found = [name for name in candidates if name in available]
+    plt.rcParams["font.sans-serif"] = found + ["DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
 
 
