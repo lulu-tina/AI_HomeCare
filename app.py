@@ -14,6 +14,8 @@
 caregiver_engine.py，本檔僅負責資料編輯介面與結果呈現，不重複實作演算法。
 """
 
+import pathlib
+
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -34,19 +36,33 @@ from caregiver_engine import (
 # ==========================================
 # 跨平台中文字型處理（避免 st.pyplot 圖表出現亂碼）
 # ==========================================
+# 直接隨 repo 附帶一份開源中文字型（Noto Sans TC, SIL Open Font License），
+# 因為系統套件（packages.txt: fonts-noto-cjk）是否真的裝進 Streamlit Cloud 容器、
+# 以及字型註冊名稱是否符合猜測，皆不受我們控制；自帶字型檔可確保任何部署環境
+# 都一定找得到，不必依賴系統/雲端環境是否裝好中文字型。
+_BUNDLED_FONT_PATH = pathlib.Path(__file__).parent / "assets" / "fonts" / "NotoSansTC-Regular.ttf"
+
+
 def setup_chinese_font():
-    # 依平台猜測字型名稱不可靠：Streamlit Cloud（Linux）容器內不一定裝有猜測的字型，
-    # 猜錯字型 matplotlib 不會報錯，只會靜默退回 DejaVu Sans（無中文字形，顯示為方框）。
-    # 改為實際查詢 matplotlib font_manager 已註冊的字型，取第一個存在的候選。
+    # 依平台猜測系統字型名稱不可靠：猜錯字型 matplotlib 不會報錯，只會靜默退回
+    # DejaVu Sans（無中文字形，顯示為方框）。優先使用自帶字型，系統字型僅作備援。
+    bundled_name = None
+    if _BUNDLED_FONT_PATH.exists():
+        fm.fontManager.addfont(str(_BUNDLED_FONT_PATH))
+        bundled_name = fm.FontProperties(fname=str(_BUNDLED_FONT_PATH)).get_name()
+
     candidates = [
         "Microsoft JhengHei", "Microsoft YaHei", "SimHei",  # Windows
         "PingFang TC", "PingFang SC", "Heiti TC", "Arial Unicode MS",  # macOS
-        "Noto Sans CJK TC", "Noto Sans CJK SC", "Noto Sans TC",  # Linux / Streamlit Cloud (packages.txt: fonts-noto-cjk)
+        "Noto Sans CJK TC", "Noto Sans CJK SC", "Noto Sans TC",  # Linux / Streamlit Cloud
         "WenQuanYi Micro Hei", "WenQuanYi Zen Hei",
     ]
     available = {f.name for f in fm.fontManager.ttflist}
     found = [name for name in candidates if name in available]
-    plt.rcParams["font.sans-serif"] = found + ["DejaVu Sans"]
+
+    ordered = ([bundled_name] if bundled_name else []) + found + ["DejaVu Sans"]
+    seen = set()
+    plt.rcParams["font.sans-serif"] = [n for n in ordered if not (n in seen or seen.add(n))]
     plt.rcParams["axes.unicode_minus"] = False
 
 
