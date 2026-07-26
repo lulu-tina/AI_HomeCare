@@ -626,3 +626,48 @@ def run_phase3_did(df_hist: pd.DataFrame) -> dict:
         "uplift_sat": ai_sat - human_sat,
         "uplift_dropout": human_dropout - ai_dropout,
     }
+
+
+# ==========================================
+# 居督人工覆寫稽核日誌 (Human-in-the-Loop override audit log)
+# ==========================================
+OVERRIDE_LOG_PATH = os.path.join("output_results", "supervisor_override_log.csv")
+
+OVERRIDE_LOG_COLUMNS = [
+    "時間戳記", "任務ID", "案家ID", "AI推薦居服員ID", "居督指定居服員ID", "變更原因",
+]
+
+
+def save_override_log(
+    task_id,
+    client_id,
+    ai_cg_id,
+    supervisor_cg_id,
+    reason: str,
+    log_path: str = OVERRIDE_LOG_PATH,
+) -> None:
+    """將居督一筆人工覆寫紀錄以附加 (append) 方式寫入 CSV 稽核日誌。
+
+    每次呼叫寫入一列；檔案不存在時先建立目錄與標題列。
+    """
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    entry = pd.DataFrame(
+        [{
+            "時間戳記": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "任務ID": task_id,
+            "案家ID": client_id,
+            "AI推薦居服員ID": ai_cg_id,
+            "居督指定居服員ID": supervisor_cg_id,
+            "變更原因": reason,
+        }],
+        columns=OVERRIDE_LOG_COLUMNS,
+    )
+    write_header = not os.path.exists(log_path)
+    entry.to_csv(log_path, mode="a", header=write_header, index=False, encoding="utf-8-sig")
+
+
+def load_override_log(log_path: str = OVERRIDE_LOG_PATH) -> pd.DataFrame:
+    """讀取現有稽核日誌；檔案不存在時回傳空的標準欄位 DataFrame。"""
+    if not os.path.exists(log_path):
+        return pd.DataFrame(columns=OVERRIDE_LOG_COLUMNS)
+    return pd.read_csv(log_path, encoding="utf-8-sig")

@@ -25,9 +25,11 @@ from ortools.linear_solver import pywraplp
 from caregiver_engine import (
     DEFAULT_EXCEL_PATH,
     PipelineConfig,
+    load_override_log,
     run_phase1_matching,
     run_phase2_optimization,
     run_phase3_did,
+    save_override_log,
 )
 
 # ==========================================
@@ -255,11 +257,14 @@ if st.button("🚀 執行 AI 最佳化派單", type="primary"):
 
     st.session_state["last_result"] = {
         "df_tasks": df_tasks,
+        "df_cg": df_cg,
         "tasks": tasks,
         "df_matches": df_matches,
         "phase2": phase2,
         "did": did,
     }
+    # 每次重新執行最佳化後，AI 建議已改變，先前的居督覆寫不再對應同一份建議，故一併清空。
+    st.session_state["overrides"] = {}
 
 if "last_result" in st.session_state:
     res = st.session_state["last_result"]
@@ -363,5 +368,158 @@ if "last_result" in st.session_state:
             file_name="assigned_results.csv",
             mime="text/csv",
         )
+
+    # ==========================================
+    # 區塊三：居督人工覆寫（Supervisor Override）與稽核日誌
+    # ==========================================
+    st.header("③ 居督人工覆寫（Supervisor Override）")
+    st.caption(
+        "當 AI 建議排單不符合實際場域狀況時（例如居服員臨時請假、案家臨時改期），"
+        "居督可於此針對個別任務手動重新指定居服員；每一筆變更皆會記錄原因並寫入稽核日誌，供後續演算法迭代分析。"
+    )
+
+    st.session_state.setdefault("overrides", {})
+    overrides = st.session_state["overrides"]
+
+    OVERRIDE_KEEP_AI = "（維持 AI 建議）"
+    OVERRIDE_UNASSIGN = "撤銷指派（不指派）"
+    OVERRIDE_REASONS = ["車程太遠", "居服員請假", "案家臨時改期", "長者情緒抗拒", "其他"]
+    OVERRIDE_TRAVEL_ALERT_THRESHOLD = 3
+
+    override_log_df = load_override_log()
+    travel_reason_count = (
+        (override_log_df["變更原因"] == "車程太遠").sum() if not override_log_df.empty else 0
+    )
+    if travel_reason_count >= OVERRIDE_TRAVEL_ALERT_THRESHOLD:
+        st.warning(
+            f"📈 稽核日誌累計已有 {travel_reason_count} 筆覆寫原因為「車程太遠」，"
+            "建議提高側邊欄的『車程扣分權重』，讓 AI 派單更優先考量就近指派。"
+        )
+
+    df_cg_run = res.get("df_cg", pd.DataFrame())
+    cg_id_options = (
+        sorted(df_cg_run["居服員ID"].astype(str).unique().tolist()) if not df_cg_run.empty else []
+    )
+    assigned_map = dict(zip(df_result["任務ID"], df_result["派單居服員"])) if not df_result.empty else {}
+
+    for _, task_row in df_tasks.iterrows():
+        t_id = task_row["任務ID"]
+        cl_id = task_row["案家ID"]
+        ai_cg = assigned_map.get(t_id)
+        ai_label = str(ai_cg) if ai_cg is not None else "未指派"
+
+        existing_override = overrides.get(t_id)
+        current_label = (
+            ("未指派" if existing_override["cg_id"] is None else str(existing_override["cg_id"]))
+            if existing_override
+            else ai_label
+        )
+
+        header = f"任務 {t_id}（案家 {cl_id}）— AI 建議：{ai_label}"
+        if existing_override:
+            header += f"　→　居督已覆寫為：{current_label}（{existing_override['reason']}）"
+
+        with st.expander(header):
+            options = [OVERRIDE_KEEP_AI] + cg_id_options + [OVERRIDE_UNASSIGN]
+            if existing_override:
+                default_val = (
+                    OVERRIDE_UNASSIGN if existing_override["cg_id"] is None else str(existing_override["cg_id"])
+                )
+                default_idx = options.index(default_val) if default_val in options else 0
+            else:
+                default_idx = 0
+
+            chosen = st.selectbox(
+                "居督手動指定居服員",
+                options,
+                index=default_idx,
+                key=f"override_select_{t_id}",
+            )
+
+            if chosen == OVERRIDE_KEEP_AI:
+                new_cg = ai_cg
+            elif chosen == OVERRIDE_UNASSIGN:
+                new_cg = None
+            else:
+                new_cg = chosen
+
+            override_happens = new_cg != ai_cg
+
+            reason = ""
+            if override_happens:
+                reason = st.selectbox(
+                    "換人原因（必填）",
+                    OVERRIDE_REASONS,
+                    key=f"override_reason_{t_id}",
+                )
+                if reason == "其他":
+                    reason = st.text_input("請說明其他原因（必填）", key=f"override_reason_detail_{t_id}")
+
+            col_confirm, col_clear = st.columns(2)
+            if col_confirm.button(
+                "✅ 確認覆寫", key=f"override_confirm_{t_id}", disabled=not override_happens, width="stretch"
+            ):
+                if not reason.strip():
+                    st.warning("請填寫換人原因後再確認。")
+                else:
+                    save_override_log(
+                        t_id, cl_id, ai_label, new_cg if new_cg is not None else "未指派", reason
+                    )
+                    overrides[t_id] = {"cg_id": new_cg, "reason": reason}
+                    st.success("已記錄居督覆寫，並寫入稽核日誌。")
+                    st.rerun()
+
+            if existing_override:
+                if col_clear.button(
+                    "↩️ 清除覆寫，還原 AI 建議", key=f"override_clear_{t_id}", width="stretch"
+                ):
+                    del overrides[t_id]
+                    st.rerun()
+
+    st.subheader("📄 最終派單結果（含居督覆寫）")
+    final_rows = []
+    for _, task_row in df_tasks.iterrows():
+        t_id = task_row["任務ID"]
+        cl_id = task_row["案家ID"]
+        base = df_result[df_result["任務ID"] == t_id] if not df_result.empty else pd.DataFrame()
+        ai_row = base.iloc[0] if not base.empty else None
+        ai_cg = ai_row["派單居服員"] if ai_row is not None else None
+
+        override = overrides.get(t_id)
+        if override:
+            final_cg = override["cg_id"]
+            change_note = f"居督覆寫：{override['reason']}"
+        else:
+            final_cg = ai_cg
+            change_note = ai_row["更新居服員原因"] if ai_row is not None else ""
+
+        final_rows.append({
+            "任務ID": t_id,
+            "案家ID": cl_id,
+            "AI建議居服員": ai_cg if ai_cg is not None else "未指派",
+            "最終派單居服員": final_cg if final_cg is not None else "未指派",
+            "適配分數": ai_row["適配分數"] if ai_row is not None else None,
+            "預估車程(分)": ai_row["預估車程(分)"] if ai_row is not None else None,
+            "服務時段": ai_row["服務時段"] if ai_row is not None else "",
+            "任務優先級": ai_row["任務優先級"] if ai_row is not None else task_row.get("任務優先級", ""),
+            "備註": change_note,
+        })
+
+    df_final = pd.DataFrame(final_rows)
+    st.dataframe(df_final, width="stretch", hide_index=True)
+
+    csv_final = df_final.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "⬇️ 匯出最終派單結果（含覆寫） (final_assignment_with_overrides.csv)",
+        csv_final,
+        file_name="final_assignment_with_overrides.csv",
+        mime="text/csv",
+    )
+
+    with st.expander("🗂️ 檢視完整稽核日誌 (supervisor_override_log.csv)"):
+        if override_log_df.empty:
+            st.info("尚無居督覆寫紀錄。")
+        else:
+            st.dataframe(override_log_df, width="stretch", hide_index=True)
 else:
     st.info("請先於上方確認／編輯資料，再按下「🚀 執行 AI 最佳化派單」開始運算。")
