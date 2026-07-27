@@ -20,6 +20,7 @@ import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+import plotly.express as px  # 👈 新增這行
 import streamlit as st
 from ortools.linear_solver import pywraplp
 
@@ -73,11 +74,11 @@ BLUE = "#2a78d6"
 ORANGE = "#eb6834"
 MUTED = "#898781"
 GOOD = "#0ca30c"
-
+# 【修改 1】將工作表從 Today_Pending_Tasks 改為 Monthly_Pending_Tasks
 REQUIRED_SHEETS = [
     "Caregiver_Profiles",
     "Client_Profiles",
-    "Today_Pending_Tasks",
+    "Monthly_Pending_Tasks",
     "Historical_Service_Logs",
 ]
 
@@ -93,8 +94,9 @@ REQUIRED_COLUMNS = {
         "案家ID", "指定居服員性別", "服務地點_經度", "服務地點_緯度", "特殊照護需求",
         "案家環境特徵", "需重度移位協助(0/1)", "歷史首選居服員ID",
     ],
-    "Today_Pending_Tasks": [
-        "任務ID", "案家ID", "時間窗_開始", "時間窗_結束", "服務歷時(分鐘)", "任務優先級",
+    # 【修改 2】任務必要欄位加入「日期」與「星期」
+    "Monthly_Pending_Tasks": [
+        "任務ID", "日期", "星期", "案家ID", "時間窗_開始", "時間窗_結束", "服務歷時(分鐘)", "任務優先級",
     ],
     "Historical_Service_Logs": [
         "居服員ID", "案家ID", "歷史媒合機制(Treatment)", "不滿意導致提早結案(0/1)", "案家滿意度(1-5)",
@@ -102,8 +104,8 @@ REQUIRED_COLUMNS = {
 }
 
 st.set_page_config(page_title="長照居家照顧 AI 派單系統", page_icon="🏠", layout="wide")
-st.title("🏠 長照居家照顧 AI 派單系統")
-st.caption("居督與營運團隊可上傳／編輯今日排班資料、調整派單政策參數，並一鍵執行 AI 最佳化派單")
+st.title("🏠 長照居家照顧 AI 派單系統（跨月排班戰情室）")
+st.caption("支援全月排班檢視、動態篩選、多維度甘特圖與 AI 最佳化派單")
 
 # ==========================================
 # 側邊欄：五項核心派單政策參數
@@ -200,36 +202,21 @@ except Exception as e:
     st.error(f"⚠️ 無法讀取上傳的檔案，請確認上傳的是有效的 Excel（.xlsx）檔案。錯誤訊息：{e}")
     st.stop()
 
-# 僅在資料來源變更時（首次載入／換檔案／原檔被覆寫）重設編輯區，避免使用者的編輯內容被覆蓋
+# 【修改 3】初始化工作階段狀態變數名稱改為 edit_monthly_tasks
 if st.session_state.get("_data_source_key") != source_key:
     st.session_state["_data_source_key"] = source_key
     st.session_state["edit_cg"] = sheets["Caregiver_Profiles"].copy()
     st.session_state["edit_cl"] = sheets["Client_Profiles"].copy()
-    st.session_state["edit_tasks"] = sheets["Today_Pending_Tasks"].copy()
+    st.session_state["edit_monthly_tasks"] = sheets["Monthly_Pending_Tasks"].copy()
     st.session_state["data_hist"] = sheets["Historical_Service_Logs"].copy()
 
 
 def render_editable_sheet(session_key: str):
-    with st.expander("➕ 新增欄位"):
-        c1, c2 = st.columns([3, 1])
-        new_col_name = c1.text_input("欄位名稱", key=f"newcol_input_{session_key}", label_visibility="collapsed",
-                                      placeholder="輸入新欄位名稱")
-        if c2.button("新增欄位", key=f"newcol_btn_{session_key}", width="stretch"):
-            df_current = st.session_state[session_key]
-            if not new_col_name:
-                st.warning("請先輸入欄位名稱。")
-            elif new_col_name in df_current.columns:
-                st.warning(f"欄位「{new_col_name}」已存在。")
-            else:
-                df_current[new_col_name] = None
-                st.session_state[session_key] = df_current
-                st.rerun()
-
     df = st.session_state[session_key]
     edited = st.data_editor(
         df,
         num_rows="dynamic",
-        width="stretch",
+        use_container_width=True,
         key=f"editor_{session_key}_{len(df.columns)}",
     )
     st.session_state[session_key] = edited
@@ -238,21 +225,16 @@ def render_editable_sheet(session_key: str):
 tab_cg, tab_cl, tab_tasks = st.tabs([
     "居服員資料 (Caregiver_Profiles)",
     "案家資料 (Client_Profiles)",
-    "今日待派任務 (Today_Pending_Tasks)",
+    "全月待派任務 (Monthly_Pending_Tasks)",
 ])
 
 with tab_cg:
-    st.caption("可直接編輯儲存格、新增／刪除列（勾選列號後按 Delete），或透過「新增欄位」新增自訂欄位。")
     render_editable_sheet("edit_cg")
-
 with tab_cl:
-    st.caption("可直接編輯儲存格、新增／刪除列，或透過「新增欄位」新增自訂欄位。")
     render_editable_sheet("edit_cl")
-
 with tab_tasks:
-    st.caption("可直接編輯儲存格、新增／刪除列，或透過「新增欄位」新增自訂欄位。")
-    render_editable_sheet("edit_tasks")
-
+    st.caption("包含跨月日期、星期與時間窗維度，可直接線上編修與新增排班。")
+    render_editable_sheet("edit_monthly_tasks")
 # ==========================================
 # 區塊二：一鍵執行與成果儀表板
 # ==========================================
@@ -261,7 +243,7 @@ st.header("② 執行最佳化派單與成果儀表板")
 if st.button("🚀 執行 AI 最佳化派單", type="primary"):
     df_cg = st.session_state["edit_cg"].copy()
     df_cl = st.session_state["edit_cl"].copy()
-    df_tasks = st.session_state["edit_tasks"].copy()
+    df_tasks = st.session_state["edit_monthly_tasks"].copy()
     df_hist = st.session_state["data_hist"].copy()
 
     try:
@@ -309,12 +291,42 @@ if "last_result" in st.session_state:
     )
     avg_score = df_result["適配分數"].mean() if not df_result.empty else 0.0
 
-    st.subheader("📌 KPI 指標")
+    st.subheader("📌 跨月派單 KPI 指標")
     k1, k2, k3 = st.columns(3)
-    k1.metric("派單成功率", f"{assign_rate:.1f}%", help=f"{assigned_count} / {total_tasks} 筆任務成功指派")
-    k2.metric("平均轉場時間", f"{avg_transition:.1f} 分", help="已派單任務的平均車程時間＋轉場緩衝時間")
-    k3.metric("平均適配得分", f"{avg_score:.1f} 分", help="已派單配對的平均適配度分數")
+    k1.metric("全月派單成功率", f"{assign_rate:.1f}%", help=f"{assigned_count} / {total_tasks} 筆任務")
+    k2.metric("平均轉場時間", f"{(df_result['預估車程(分)'].mean() + config.buffer_mins):.1f} 分")
+    k3.metric("平均適配得分", f"{df_result['適配分數'].mean():.1f} 分")
 
+    # 【修改 4】整合跨月甘特圖與明細呈現
+    st.subheader("📊 跨月派單甘特圖與分析")
+    
+    # 將日期與時間窗結合成 datetime 格式供 Plotly 甘特圖使用
+    if not df_result.empty and "日期" in df_result.columns:
+        df_result["開始時間"] = pd.to_datetime(df_result["日期"].astype(str) + " " + df_result["服務時段"].str.split("-").str[0], errors="coerce")
+        df_result["結束時間"] = pd.to_datetime(df_result["日期"].astype(str) + " " + df_result["服務時段"].str.split("-").str[1], errors="coerce")
+        
+        # 繪製 Plotly 甘特圖
+        fig_gantt = px.timeline(
+            df_result,
+            x_start="開始時間",
+            x_end="結束時間",
+            y="派單居服員",
+            color="任務優先級",
+            hover_data=["任務ID", "案家ID", "適配分數"],
+            title="居服員全月派單時間甘特圖"
+        )
+        fig_gantt.update_yaxes(autorange="reversed")
+        st.plotly_chart(fig_gantt, use_container_width=True)
+
+    st.subheader("📋 最終派單明細總表")
+    display_cols = [
+        "任務ID", "案家ID", "派單居服員", "適配分數", "預估車程(分)", "服務時段", "任務優先級", "更新居服員原因"
+    ]
+    st.dataframe(df_result[display_cols] if not df_result.empty else pd.DataFrame(), use_container_width=True, hide_index=True)
+
+else:
+    st.info("請先確認上方排班資料，再點擊「🚀 執行 AI 最佳化派單」按鈕開始運算。")
+    
     st.subheader("📊 派單分析儀表板")
     if df_matches.empty:
         st.info("目前無候選配對可供分析（可能所有配對皆被硬性條件過濾）。")
