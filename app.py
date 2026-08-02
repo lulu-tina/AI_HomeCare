@@ -15,12 +15,10 @@ caregiver_engine.py，本檔僅負責資料編輯介面與結果呈現，不重�
 """
 
 import pathlib
-
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
-import plotly.express as px  # 👈 新增這行
 import streamlit as st
 from ortools.linear_solver import pywraplp
 
@@ -32,8 +30,8 @@ from caregiver_engine import (
     run_phase2_optimization,
     run_phase3_did,
     save_override_log,
+    calculate_task_revenue_and_salary,
 )
-
 # ==========================================
 # 跨平台中文字型處理（避免 st.pyplot 圖表出現亂碼）
 # ==========================================
@@ -74,7 +72,7 @@ BLUE = "#2a78d6"
 ORANGE = "#eb6834"
 MUTED = "#898781"
 GOOD = "#0ca30c"
-# 【修改 1】將工作表從 Today_Pending_Tasks 改為 Monthly_Pending_Tasks
+
 REQUIRED_SHEETS = [
     "Caregiver_Profiles",
     "Client_Profiles",
@@ -86,17 +84,16 @@ REQUIRED_COLUMNS = {
     "Caregiver_Profiles": [
         "居服員ID", "性別", "服務起點_經度(家)", "服務起點_緯度(家)", "核心專長證照",
         "每日工時上限(小時)", "當月累計服務時數(疲勞度)", "歷史滿意度均值",
-        "具備重度移位體力(0/1)", "今日既定行程1_時段", "今日既定行程1_地點經度",
-        "今日既定行程1_地點緯度", "今日既定行程2_時段", "今日既定行程2_地點經度",
-        "今日既定行程2_地點緯度", "特殊排斥條件", "今日已佔用工時(小時)",
+        "具備重度移位體力(0/1)", "特殊排斥條件",
+        "可排班星期", "每日可服務時段_起", "每日可服務時段_迄", "請假或不排班日期"
     ],
     "Client_Profiles": [
         "案家ID", "指定居服員性別", "服務地點_經度", "服務地點_緯度", "特殊照護需求",
         "案家環境特徵", "需重度移位協助(0/1)", "歷史首選居服員ID",
     ],
-    # 【修改 2】任務必要欄位加入「日期」與「星期」
     "Monthly_Pending_Tasks": [
-        "任務ID", "日期", "星期", "案家ID", "時間窗_開始", "時間窗_結束", "服務歷時(分鐘)", "任務優先級",
+        "任務ID", "案家ID", "日期", "星期", "時間窗_開始", "時間窗_結束", 
+        "服務歷時(分鐘)", "任務優先級", "Service_Code_1", "Units_1", "Service_Code_2", "Units_2"
     ],
     "Historical_Service_Logs": [
         "居服員ID", "案家ID", "歷史媒合機制(Treatment)", "不滿意導致提早結案(0/1)", "案家滿意度(1-5)",
@@ -104,8 +101,8 @@ REQUIRED_COLUMNS = {
 }
 
 st.set_page_config(page_title="長照居家照顧 AI 派單系統", page_icon="🏠", layout="wide")
-st.title("🏠 長照居家照顧 AI 派單系統（跨月排班戰情室）")
-st.caption("支援全月排班檢視、動態篩選、多維度甘特圖與 AI 最佳化派單")
+st.title("🏠 長照居家照顧 AI 派單系統")
+st.caption("居督與營運團隊可上傳／編輯今日排班資料、調整派單政策參數，並一鍵執行 AI 最佳化派單")
 
 # ==========================================
 # 側邊欄：五項核心派單政策參數
@@ -148,6 +145,11 @@ with st.sidebar:
         key="cfg_skill_bonus",
         help="居服員持有之核心專長證照符合案家特殊照護需求時的加分。",
     )
+    salary_rate = st.slider(
+        "居服員點數薪資抽成比率 (%)", 50.0, 80.0, float(defaults.caregiver_salary_rate_per_point * 100), 1.0,
+        key="cfg_salary_rate",
+        help="每一元申報營收（點數）中，撥付給居服員作為薪資拆帳的比例。",
+    )
 
 config = PipelineConfig(
     buffer_mins=buffer_mins,
@@ -157,6 +159,7 @@ config = PipelineConfig(
     preferred_caregiver_bonus=continuity_bonus,
     cert_bonus_dementia=skill_bonus,
     cert_bonus_other=skill_bonus,
+    caregiver_salary_rate_per_point=salary_rate / 100.0
 )
 
 # ==========================================
@@ -202,21 +205,36 @@ except Exception as e:
     st.error(f"⚠️ 無法讀取上傳的檔案，請確認上傳的是有效的 Excel（.xlsx）檔案。錯誤訊息：{e}")
     st.stop()
 
-# 【修改 3】初始化工作階段狀態變數名稱改為 edit_monthly_tasks
+# 僅在資料來源變更時（首次載入／換檔案／原檔被覆寫）重設編輯區，避免使用者的編輯內容被覆蓋
 if st.session_state.get("_data_source_key") != source_key:
     st.session_state["_data_source_key"] = source_key
     st.session_state["edit_cg"] = sheets["Caregiver_Profiles"].copy()
     st.session_state["edit_cl"] = sheets["Client_Profiles"].copy()
-    st.session_state["edit_monthly_tasks"] = sheets["Monthly_Pending_Tasks"].copy()
+    st.session_state["edit_tasks"] = sheets["Monthly_Pending_Tasks"].copy()
     st.session_state["data_hist"] = sheets["Historical_Service_Logs"].copy()
 
 
 def render_editable_sheet(session_key: str):
+    with st.expander("➕ 新增欄位"):
+        c1, c2 = st.columns([3, 1])
+        new_col_name = c1.text_input("欄位名稱", key=f"newcol_input_{session_key}", label_visibility="collapsed",
+                                      placeholder="輸入新欄位名稱")
+        if c2.button("新增欄位", key=f"newcol_btn_{session_key}", width="stretch"):
+            df_current = st.session_state[session_key]
+            if not new_col_name:
+                st.warning("請先輸入欄位名稱。")
+            elif new_col_name in df_current.columns:
+                st.warning(f"欄位「{new_col_name}」已存在。")
+            else:
+                df_current[new_col_name] = None
+                st.session_state[session_key] = df_current
+                st.rerun()
+
     df = st.session_state[session_key]
     edited = st.data_editor(
         df,
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         key=f"editor_{session_key}_{len(df.columns)}",
     )
     st.session_state[session_key] = edited
@@ -225,49 +243,125 @@ def render_editable_sheet(session_key: str):
 tab_cg, tab_cl, tab_tasks = st.tabs([
     "居服員資料 (Caregiver_Profiles)",
     "案家資料 (Client_Profiles)",
-    "全月待派任務 (Monthly_Pending_Tasks)",
+    "本月待派任務 (Monthly_Pending_Tasks)",
 ])
 
 with tab_cg:
+    st.caption("可直接編輯儲存格、新增／刪除列（勾選列號後按 Delete），或透過「新增欄位」新增自訂欄位。")
     render_editable_sheet("edit_cg")
+
 with tab_cl:
+    st.caption("可直接編輯儲存格、新增／刪除列，或透過「新增欄位」新增自訂欄位。")
     render_editable_sheet("edit_cl")
+
 with tab_tasks:
-    st.caption("包含跨月日期、星期與時間窗維度，可直接線上編修與新增排班。")
-    render_editable_sheet("edit_monthly_tasks")
+    st.caption("可直接編輯儲存格、新增／刪除列，或透過「新增欄位」新增自訂欄位。")
+    render_editable_sheet("edit_tasks")
+
 # ==========================================
 # 區塊二：一鍵執行與成果儀表板
 # ==========================================
-st.header("② 執行最佳化派單與成果儀表板")
-
 if st.button("🚀 執行 AI 最佳化派單", type="primary"):
+
     df_cg = st.session_state["edit_cg"].copy()
     df_cl = st.session_state["edit_cl"].copy()
-    df_tasks = st.session_state["edit_monthly_tasks"].copy()
+    df_tasks = st.session_state["edit_tasks"].copy()
     df_hist = st.session_state["data_hist"].copy()
 
     try:
-        tasks = df_tasks.merge(df_cl, on="案家ID", how="left")
-        df_matches = run_phase1_matching(tasks, df_cg, config)
-        phase2 = run_phase2_optimization(df_matches, tasks, df_cg, config)
-        did = run_phase3_did(df_hist)
-    except Exception as e:
-        st.error(
-            "⚠️ 派單運算過程發生錯誤，請確認表格中的 ID 對應是否存在、數值欄位是否填寫正確"
-            f"（例如經緯度、工時、時間格式「HH:MM」）。錯誤訊息：{e}"
+
+        # ==========================
+        # 資料整理
+        # ==========================
+        tasks = df_tasks.merge(
+            df_cl,
+            on="案家ID",
+            how="left"
         )
+
+        st.info(
+            f"📋 資料載入完成："
+            f"任務 {len(tasks)} 筆 / "
+            f"居服員 {len(df_cg)} 人"
+        )
+
+
+        # ==========================
+        # Phase 1
+        # ==========================
+        st.info("⏳ Phase 1：開始候選配對與適配度評分")
+
+        df_matches = run_phase1_matching(
+            tasks,
+            df_cg,
+            config
+        )
+
+        st.success(
+            f"✅ Phase 1 完成，產生候選配對 {len(df_matches)} 筆"
+        )
+
+
+        # ==========================
+        # Phase 2
+        # ==========================
+        st.info("⏳ Phase 2：開始 OR-Tools 最佳化派單")
+
+        phase2 = run_phase2_optimization(
+            df_matches,
+            tasks,
+            df_cg,
+            config
+        )
+
+        st.success(
+            f"✅ Phase 2 完成，成功派單 {phase2['assigned_count']} 筆"
+        )
+
+
+        # ==========================
+        # Phase 3
+        # ==========================
+        st.info("⏳ Phase 3：開始 DiD 效益分析")
+
+        did = run_phase3_did(
+            df_hist
+        )
+
+        st.success("✅ Phase 3 完成")
+
+
+    except Exception as e:
+
+        st.error(
+            "⚠️ 派單運算過程發生錯誤"
+        )
+
+        st.exception(e)
+
         st.stop()
 
+
+    # ==========================
+    # 儲存結果
+    # ==========================
+
     st.session_state["last_result"] = {
+
         "df_tasks": df_tasks,
         "df_cg": df_cg,
         "tasks": tasks,
         "df_matches": df_matches,
         "phase2": phase2,
         "did": did,
+
     }
-    # 每次重新執行最佳化後，AI 建議已改變，先前的居督覆寫不再對應同一份建議，故一併清空。
+
+
+    # 清除舊人工覆寫
     st.session_state["overrides"] = {}
+
+    st.success("🎉 AI 最佳化派單完成！")
 
 if "last_result" in st.session_state:
     res = st.session_state["last_result"]
@@ -291,42 +385,12 @@ if "last_result" in st.session_state:
     )
     avg_score = df_result["適配分數"].mean() if not df_result.empty else 0.0
 
-    st.subheader("📌 跨月派單 KPI 指標")
+    st.subheader("📌 KPI 指標")
     k1, k2, k3 = st.columns(3)
-    k1.metric("全月派單成功率", f"{assign_rate:.1f}%", help=f"{assigned_count} / {total_tasks} 筆任務")
-    k2.metric("平均轉場時間", f"{(df_result['預估車程(分)'].mean() + config.buffer_mins):.1f} 分")
-    k3.metric("平均適配得分", f"{df_result['適配分數'].mean():.1f} 分")
+    k1.metric("派單成功率", f"{assign_rate:.1f}%", help=f"{assigned_count} / {total_tasks} 筆任務成功指派")
+    k2.metric("平均轉場時間", f"{avg_transition:.1f} 分", help="已派單任務的平均車程時間＋轉場緩衝時間")
+    k3.metric("平均適配得分", f"{avg_score:.1f} 分", help="已派單配對的平均適配度分數")
 
-    # 【修改 4】整合跨月甘特圖與明細呈現
-    st.subheader("📊 跨月派單甘特圖與分析")
-    
-    # 將日期與時間窗結合成 datetime 格式供 Plotly 甘特圖使用
-    if not df_result.empty and "日期" in df_result.columns:
-        df_result["開始時間"] = pd.to_datetime(df_result["日期"].astype(str) + " " + df_result["服務時段"].str.split("-").str[0], errors="coerce")
-        df_result["結束時間"] = pd.to_datetime(df_result["日期"].astype(str) + " " + df_result["服務時段"].str.split("-").str[1], errors="coerce")
-        
-        # 繪製 Plotly 甘特圖
-        fig_gantt = px.timeline(
-            df_result,
-            x_start="開始時間",
-            x_end="結束時間",
-            y="派單居服員",
-            color="任務優先級",
-            hover_data=["任務ID", "案家ID", "適配分數"],
-            title="居服員全月派單時間甘特圖"
-        )
-        fig_gantt.update_yaxes(autorange="reversed")
-        st.plotly_chart(fig_gantt, use_container_width=True)
-
-    st.subheader("📋 最終派單明細總表")
-    display_cols = [
-        "任務ID", "案家ID", "派單居服員", "適配分數", "預估車程(分)", "服務時段", "任務優先級", "更新居服員原因"
-    ]
-    st.dataframe(df_result[display_cols] if not df_result.empty else pd.DataFrame(), use_container_width=True, hide_index=True)
-
-else:
-    st.info("請先確認上方排班資料，再點擊「🚀 執行 AI 最佳化派單」按鈕開始運算。")
-    
     st.subheader("📊 派單分析儀表板")
     if df_matches.empty:
         st.info("目前無候選配對可供分析（可能所有配對皆被硬性條件過濾）。")
