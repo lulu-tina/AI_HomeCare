@@ -194,7 +194,6 @@ try:
         import os
 
         if not os.path.exists(DEFAULT_EXCEL_PATH):
-            st.error(f"找不到預設檔案：{DEFAULT_EXCEL_PATH}，請改用上方上傳功能。")
             st.stop()
         source_key = f"default::{os.path.getmtime(DEFAULT_EXCEL_PATH)}"
         sheets = _read_raw_sheets(DEFAULT_EXCEL_PATH)
